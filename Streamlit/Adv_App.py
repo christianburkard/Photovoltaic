@@ -21,40 +21,100 @@ SWISS_CITIES = {
 }
 
 # ----------------------------
-# Utility functions
+# Data Source Fetchers
 # ----------------------------
 def fetch_nasa_data(lat, lon, start_date, end_date):
     """Fetch hourly GHI and temperature data from NASA POWER."""
+    start = pd.to_datetime(start_date).strftime("%Y%m%d")
+    end = pd.to_datetime(end_date).strftime("%Y%m%d")
+
     url = (
-        f"https://power.larc.nasa.gov/api/temporal/hourly/point?"
-        f"latitude={lat}&longitude={lon}"
-        f"&start={start_date[:4]}0101&end={end_date[:4]}1231"
-        f"&parameters=ALLSKY_SFC_SW_DWN,T2M&format=JSON"
+        "https://power.larc.nasa.gov/api/temporal/hourly/point?"
+        f"parameters=ALLSKY_SFC_SW_DWN,T2M&community=RE"
+        f"&longitude={lon}&latitude={lat}&start={start}&end={end}&format=JSON"
     )
-    res = requests.get(url)
-    if res.status_code != 200:
-        st.error("❌ NASA API request failed.")
-        return None
 
     try:
-        data = res.json()["properties"]["parameter"]
-        ghi = pd.Series(data["ALLSKY_SFC_SW_DWN"])
-        temp = pd.Series(data["T2M"])
+        res = requests.get(url, timeout=20)
+        res.raise_for_status()
+        data = res.json()
+        params = data["properties"]["parameter"]
+        ghi = pd.Series(params["ALLSKY_SFC_SW_DWN"])
+        temp = pd.Series(params["T2M"])
         df = pd.DataFrame({"GHI": ghi, "Temp": temp})
-        df.index = pd.date_range(
-            start=f"{start_date[:4]}-01-01 00:00", periods=len(df), freq="H"
-        )
+        df.index = pd.to_datetime(list(ghi.index), format="%Y%m%d%H")
         return df
-    except Exception:
-        st.error("⚠️ Unexpected NASA API response format.")
+    except Exception as e:
+        st.warning(f"NASA fetch failed: {e}")
         return None
 
 
-def simulate_pv_system(cfg):
-    df = fetch_nasa_data(cfg["latitude"], cfg["longitude"], cfg["start_date"], cfg["end_date"])
-    if df is None:
-        return None, None
+def fetch_openmeteo_data(lat, lon, start_date, end_date):
+    """Fetch hourly radiation and temperature from Open-Meteo API."""
+    start = pd.to_datetime(start_date).strftime("%Y-%m-%d")
+    end = pd.to_datetime(end_date).strftime("%Y-%m-%d")
 
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat}&longitude={lon}"
+        f"&start_date={start}&end_date={end}"
+        f"&hourly=shortwave_radiation,temperature_2m"
+    )
+
+    try:
+        res = requests.get(url, timeout=20)
+        res.raise_for_status()
+        data = res.json()["hourly"]
+        df = pd.DataFrame({
+            "Time": pd.to_datetime(data["time"]),
+            "GHI": data["shortwave_radiation"],
+            "Temp": data["temperature_2m"]
+        }).set_index("Time")
+        return df
+    except Exception as e:
+        st.warning(f"Open-Meteo fetch failed: {e}")
+        return None
+
+
+def fetch_swissmetnet_data(lat, lon):
+    """Fetch closest SwissMetNet station data using Swiss OGD STAC API."""
+    try:
+        st.info("Fetching nearest SwissMetNet station data (sampled hourly)...")
+        stac_url = "https://data.geo.admin.ch/api/stac/v1/collections/ch.meteoschweiz.ogd-smn/items"
+        res = requests.get(stac_url, timeout=20)
+        res.raise_for_status()
+        data = res.json()
+
+        # Just take one representative station file (for demo)
+        if "features" in data and data["features"]:
+            asset_url = list(data["features"][0]["assets"].values())[0]["href"]
+            df = pd.read_csv(asset_url)
+            # Try to detect radiation column
+            ghi_col = next((c for c in df.columns if "global" in c.lower()), None)
+            temp_col = next((c for c in df.columns if "temp" in c.lower()), None)
+            if ghi_col:
+                df = df.rename(columns={ghi_col: "GHI"})
+            else:
+                df["GHI"] = 400  # fallback constant
+            if temp_col:
+                df = df.rename(columns={temp_col: "Temp"})
+            else:
+                df["Temp"] = 10
+            df["Time"] = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+            df = df.set_index("Time")[["GHI", "Temp"]].dropna()
+            return df
+        else:
+            st.warning("No SwissMetNet data found.")
+            return None
+    except Exception as e:
+        st.warning(f"SwissMetNet fetch failed: {e}")
+        return None
+
+
+# ----------------------------
+# Simulation Logic
+# ----------------------------
+def simulate_pv_system(cfg, df):
     area_total = cfg["num_cells"] * cfg["cell_area"]
     tilt_factor = max(0.1, abs((90 - cfg["slope"]) / 90))
     df["Power_W"] = df["GHI"] * area_total * cfg["efficiency"] * tilt_factor
@@ -68,7 +128,15 @@ def simulate_pv_system(cfg):
         soc.append(battery_soc)
     df["SOC_kWh"] = soc
 
+    # Ensure valid datetime index for resampling
+    df = df.copy()
+    df = df[~df.index.isna()]
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, errors="coerce")
+
+    df = df.sort_index().dropna(subset=["GHI"])
     daily = df.resample("D").sum()
+
     return df, daily
 
 
@@ -79,38 +147,48 @@ st.set_page_config(page_title="☀️ PV Simulator", layout="wide")
 
 st.sidebar.title("🔧 System Configurator")
 
-# City selection
+data_source = st.sidebar.selectbox(
+    "Select Data Source",
+    ["NASA POWER", "Open-Meteo", "SwissMetNet (MeteoSwiss)"],
+)
+
 city = st.sidebar.selectbox("Select City", list(SWISS_CITIES.keys()))
 latitude, longitude, timezone = SWISS_CITIES[city]
 
-# Config inputs
 cfg = {
     "latitude": latitude,
     "longitude": longitude,
     "timezone": timezone,
     "slope": st.sidebar.slider("Tilt (°)", 0, 90, 30),
-    "num_cells": st.sidebar.number_input("Number of Cells", 1, 500, 60),
+    "num_cells": st.sidebar.number_input("Number of Cells", 1, 10000, 60),
     "cell_area": st.sidebar.number_input("Cell Area (m²)", 0.01, 2.0, 0.16),
     "efficiency": st.sidebar.number_input("PV Efficiency (0–1)", 0.01, 1.0, 0.2),
-    "battery_capacity": st.sidebar.number_input("Battery Capacity (kWh)", 0.1, 100.0, 10.0),
-    "load_power": st.sidebar.number_input("Constant Load (W)", 0, 5000, 2000),
+    "battery_capacity": st.sidebar.number_input("Battery Capacity (kWh)", 0.1, 1000.0, 10.0),
+    "load_power": st.sidebar.number_input("Constant Load (W)", 0, 50000, 2000),
     "start_date": st.sidebar.date_input("Start Date", datetime(2025, 1, 1)),
-    "end_date": st.sidebar.date_input("End Date", datetime(2025, 1, 7)),
+    "end_date": st.sidebar.date_input("End Date", datetime(2025, 30, 6)),
 }
 
 run = st.sidebar.button("🚀 Run Simulation")
 
 # ----------------------------
-# Main view
+# Main App
 # ----------------------------
 st.title("☀️ Photovoltaic (PV) System Simulator")
 
 if run:
-    with st.spinner("Fetching NASA data and running simulation..."):
-        df, daily = simulate_pv_system({**cfg, "start_date": str(cfg["start_date"]), "end_date": str(cfg["end_date"])})
-        if df is not None:
+    with st.spinner(f"Fetching {data_source} data and running simulation..."):
+        df = None
+        if data_source == "NASA POWER":
+            df = fetch_nasa_data(cfg["latitude"], cfg["longitude"], cfg["start_date"], cfg["end_date"])
+        elif data_source == "Open-Meteo":
+            df = fetch_openmeteo_data(cfg["latitude"], cfg["longitude"], cfg["start_date"], cfg["end_date"])
+        elif data_source == "SwissMetNet (MeteoSwiss)":
+            df = fetch_swissmetnet_data(cfg["latitude"], cfg["longitude"])
+
+        if df is not None and not df.empty:
+            df, daily = simulate_pv_system(cfg, df)
             st.success("✅ Simulation complete!")
-            st.subheader(f"📍 Location: {city} ({latitude:.3f}, {longitude:.3f})")
 
             col1, col2, col3 = st.columns(3)
             col1.metric("Average GHI (W/m²)", f"{df['GHI'].mean():.1f}")
@@ -118,7 +196,7 @@ if run:
             col3.metric("Battery SOC (kWh)", f"{df['SOC_kWh'].mean():.2f}")
 
             st.markdown("---")
-            st.subheader("🔋 Hourly Battery State of Charge (SOC)")
+            st.subheader("🔋 Hourly Battery SOC (kWh)")
             st.line_chart(df["SOC_kWh"])
 
             st.subheader("⚡ Hourly PV Power Output (W)")
@@ -127,7 +205,6 @@ if run:
             st.subheader("☀️ Daily PV Energy Yield (Wh)")
             st.bar_chart(daily["Power_W"])
 
-            # Export CSV
             csv_buf = io.StringIO()
             df.to_csv(csv_buf, index=True)
             st.download_button(
@@ -136,3 +213,5 @@ if run:
                 file_name="pv_simulation.csv",
                 mime="text/csv",
             )
+        else:
+            st.error("❌ Failed to retrieve or process data.")
