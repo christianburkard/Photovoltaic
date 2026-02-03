@@ -18,6 +18,8 @@ SWISS_CITIES = {
     "St. Gallen": (47.4245, 9.3767, 1),
     "Lugano": (46.0037, 8.9511, 1),
     "Biel/Bienne": (47.1325, 7.2441, 1),
+    "Aarau": (47.390865, 8.058927, 1),
+    "Waltenschwil": (47.332069, 8.298866, 1),
 }
 
 # ----------------------------
@@ -166,7 +168,7 @@ cfg = {
     "battery_capacity": st.sidebar.number_input("Battery Capacity (kWh)", 0.1, 1000.0, 10.0),
     "load_power": st.sidebar.number_input("Constant Load (W)", 0, 50000, 2000),
     "start_date": st.sidebar.date_input("Start Date", datetime(2025, 1, 1)),
-    "end_date": st.sidebar.date_input("End Date", datetime(2025, 30, 6)),
+    "end_date": st.sidebar.date_input("End Date", datetime(2025, 6, 30)),
 }
 
 run = st.sidebar.button("🚀 Run Simulation")
